@@ -2,7 +2,7 @@
 # Access Matrix Pipeline — Unified Configuration
 # ============================================================================
 # Six-stage end-to-end pipeline:
-#   1. copy             — pull newest access-matrix xlsx files from the source
+#   1. copy             — pull the latest PROD access-matrix xlsx of every matrix from the source
 #   2. process          — read each xlsx, apply red/white formatting rules, write CSV
 #   3. compare          — read each csv, compare against Oracle, write diff xlsx
 #   4. summary_all_diff — aggregate every *_comparison.xlsx in all_differences/
@@ -145,41 +145,56 @@ skip_files:
 #   keep_all    — copy every occurrence (renamed file_1.xlsx, file_2.xlsx, …).
 duplicate_handling: keep_newest
 
-# Which matrix file is picked when a folder holds several Excel files
-# (e.g. old versions, UAT copies, temp copies of the same matrix).
-#   - Only PRODUCTION matrices are copied. Any file whose NAME contains one of
-#     `exclude_keywords` as a whole word (UAT, temp ...) is ignored.
-#   - Among the remaining files the winner is the one with the NEWEST DATE
-#     written in the file name (e.g. 'Prod_19102026' beats 'Prod_17092026').
-#     If the dates are equal (or a name has no readable date), the HIGHEST
-#     VERSION in the name decides (V10 beats V9; 'V2_..._Prod V1 ...' is v2).
-#     A name with no readable date loses against a name that has one.
-#     The Windows "Date modified" is NOT used, except as the very last
-#     tie-break.
-#   - Everything that was not copied is listed, with the reason, in the
-#     "Not Selected" sheet of 02_Reports/access_matrix_index_*.xlsx.
+# Which matrix files are copied.
+#   - The whole source tree is examined at once (NOT folder by folder), so the
+#     Prod copy, the UAT copy, the temp copy and the old versions of a matrix
+#     are compared with each other even when they sit in different folders.
+#   - Only PRODUCTION matrices are copied. A file is ignored when its NAME
+#     contains one of `exclude_keywords` (UAT, temp ...) - also when glued,
+#     e.g. 'SMEUAT_', 'ProdTemp'. If the file name says nothing, the names of
+#     its folders are checked the same way (see check_folder_names).
+#   - Per matrix exactly ONE file wins: the NEWEST DATE written in the file
+#     name (e.g. 'Prod_19102026' beats 'Prod_17092026'); if the dates are
+#     equal, the HIGHEST VERSION in the name (V10 beats V9). A name with no
+#     readable date loses against a name that has one. The Windows
+#     "Date modified" is only the very last tie-break.
+#   - 02_Reports/access_matrix_index_*.xlsx explains every decision:
+#       sheet "Access Matrix Index"  - what was copied (date / version / env)
+#       sheet "Not Selected"         - every other file and WHY it was left
+#       sheet "Possible Duplicates"  - copied files that look like the same
+#                                      matrix under two different spellings
+#                                      (review these by hand)
 matrix_selection:
-  # Words (case-insensitive, whole-word) that mark a file as NOT production.
+  # Words (case-insensitive) that mark a file as NOT production.
   exclude_keywords:
     - uat
     - temp
     - temporary
     - tmp
 
-  # Files with no environment word at all (neither Prod nor UAT/temp), e.g.
-  # 'V29_Access Matrix _F.xlsx'. A file that says 'Prod' always wins over
-  # them; this switch only decides what happens in a folder that has NO
-  # file saying 'Prod':
-  #   true  -> use the highest-version unmarked file
-  #   false -> copy nothing from that folder (strict prod-only)
+  # true  -> when a FILE name has neither Prod nor UAT/temp in it, look at the
+  #          names of the folders it sits in (below source_folder): a folder
+  #          called 'UAT' / 'Temp' excludes it, a folder called 'Prod' makes
+  #          it production.
+  # false -> only file names are looked at.
+  check_folder_names: true
+
+  # Files with no environment word at all, neither in the file name nor in
+  # the folder names (e.g. 'V29_Access Matrix _F.xlsx'). A 'Prod' file of the
+  # same matrix always wins over them; this switch only decides what happens
+  # when a matrix has NO file saying 'Prod':
+  #   true  -> use the newest unmarked file
+  #   false -> copy nothing for that matrix (strict prod-only)
   include_unmarked: true
 
-  # folder -> exactly ONE matrix per folder (the latest prod one). Same as
-  #          the previous behaviour, only the choice of file changed.
-  # name   -> one matrix per distinct matrix name inside the folder (use this
-  #          if a folder legitimately holds several different matrices, e.g.
-  #          the CardCenter 'Split' files, and you want the latest of each).
-  scope: folder
+  # How files are grouped into "one matrix":
+  #   matrix -> (recommended) files in the same folder are one matrix, AND
+  #             files with the same matrix name are one matrix even when they
+  #             are in different folders. One file is copied per matrix.
+  #   folder -> one file per folder only (no cross-folder comparison).
+  #   name   -> one file per matrix NAME only; a folder that holds several
+  #             different matrices yields one file for each of them.
+  scope: matrix
 
 # strftime pattern used for the timestamp inserted into log/report names
 # inside 02_Reports/ (this is separate from the run-folder timestamp above).

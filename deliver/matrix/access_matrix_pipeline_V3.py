@@ -12,10 +12,11 @@ and every stage's outputs land in a subfolder of that run folder:
     <run_folder>\failures\
 
 Stage 1 (copy):             walks the network share and copies the latest
-                            PRODUCTION matrix of every folder into FILES_FOLDER
-                            (UAT / temp files are ignored; the winner is the
-                            newest date written in the file NAME, then the
-                            highest version, not the Windows modified date) and writes an index
+                            PRODUCTION file of every matrix into FILES_FOLDER
+                            (one file per matrix over the whole tree; UAT /
+                            temp files are ignored; the winner is the newest
+                            date written in the file NAME, then the highest
+                            version, not the Windows modified date) and writes an index
                             xlsx + log into REPORTS_FOLDER.
 Stage 2 (process):          reads each xlsx in FILES_FOLDER, picks the matrix
                             sheet by scanning the top-left 10x10 for the
@@ -357,22 +358,25 @@ if DUPLICATE_HANDLING not in {"keep_newest", "keep_all"}:
         f"Use 'keep_newest' or 'keep_all'."
     )
 
-# --- Stage 1: which matrix file wins inside a folder ------------------------
-# Only PRODUCTION matrices are copied. A file is rejected when its name
-# carries one of `exclude_keywords` (UAT / temp ...). Among the remaining
-# files the winner is chosen by the DATE written in the file name, then by
-# the VERSION in the name (V10, V11 ...) - NOT by the Windows "Date modified".
+# --- Stage 1: which matrix files are copied ---------------------------------
+# Only PRODUCTION matrices are copied. A file is rejected when its name (or,
+# if the name says nothing, its folder) carries one of `exclude_keywords`
+# (UAT / temp ...). The selection is done over the WHOLE tree: for every
+# matrix exactly one file wins - the one with the newest DATE written in the
+# file name, then the highest VERSION in the name (V10, V11 ...). The Windows
+# "Date modified" is only the very last tie-break.
 _sel = CONFIG.get("matrix_selection") or {}
 EXCLUDE_KEYWORDS = [str(k).strip().lower()
                     for k in (_sel.get("exclude_keywords")
                               or ["uat", "temp", "temporary", "tmp"])
                     if str(k).strip()]
 INCLUDE_UNMARKED = bool(_sel.get("include_unmarked", True))
-SELECTION_SCOPE = str(_sel.get("scope", "folder")).strip().lower()
-if SELECTION_SCOPE not in {"folder", "name"}:
+CHECK_FOLDER_NAMES = bool(_sel.get("check_folder_names", True))
+SELECTION_SCOPE = str(_sel.get("scope", "matrix")).strip().lower()
+if SELECTION_SCOPE not in {"matrix", "folder", "name"}:
     raise ValueError(
         f"Invalid matrix_selection.scope in {CONFIG_PATH}: {SELECTION_SCOPE!r}. "
-        f"Use 'folder' or 'name'."
+        f"Use 'matrix', 'folder' or 'name'."
     )
 
 TIMESTAMP_FORMAT = CONFIG.get("timestamp_format", "%Y%m%d_%H%M%S")
@@ -506,10 +510,14 @@ def _stage1_setup_logging():
 
 
 # ----------------------------------------------------------------------------
-# Matrix file selection (production only, newest VERSION wins)
+# Matrix file selection (production only, newest DATE in the name wins)
 # ----------------------------------------------------------------------------
+# The selection is done over the WHOLE source tree, not folder by folder,
+# because the Prod copy, the UAT copy, the temp copy and the older versions
+# of one matrix often live in different folders.
+#
 # Typical names:
-#   V10_Access_Matrix_FlexCube_SBO_PROD_ 09-11-2026.xlsx     -> prod, v10
+#   V10_Access_Matrix_FlexCube_SBO_PROD_ 09-11-2026.xlsx     -> prod, 09-11-2026
 #   V10_Access_Matrix_FlexCube_SBO_UAT_ 05-11-2026(...).xlsx -> UAT  (ignored)
 #   V10_..._Operation-TMO_PROD_02-06-2026_Temp.xlsx          -> temp (ignored)
 #   Pre Security Access Matrix FlexCube of HR  Prod V1 19-10-2023.xlsx -> v1
@@ -518,9 +526,22 @@ def _stage1_setup_logging():
 _VERSION_LEAD_RE = re.compile(r"^\W*v\s*(\d+(?:\.\d+)*)(?!\d)", re.IGNORECASE)
 _VERSION_ANY_RE = re.compile(r"(?<![a-z0-9])v\s*(\d+(?:\.\d+)*)(?!\d)",
                              re.IGNORECASE)
-_DATE_SEP_RE = re.compile(r"(?<!\d)(\d{1,2})[-_./ ](\d{1,2})[-_./ ](\d{4})(?!\d)")
-_DATE_COMPACT_RE = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{4})(?!\d)")
 _PROD_RE = re.compile(r"prod(?:uction)?(?![a-z])", re.IGNORECASE)
+
+_DATE_YEAR_MIN, _DATE_YEAR_MAX = 2010, 2040
+_MONTH_NUM = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_DATE_DMY_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*[-_./]\s*(\d{1,2})\s*[-_./]\s*(\d{4}|\d{2})(?!\d)")
+_DATE_DMY_SPACE_RE = re.compile(r"(?<!\d)(\d{1,2}) (\d{1,2}) (\d{4})(?!\d)")
+_DATE_YMD_RE = re.compile(
+    r"(?<!\d)(20\d{2})\s*[-_./]\s*(\d{1,2})\s*[-_./]\s*(\d{1,2})(?!\d)")
+_DATE_MONTHNAME_RE = re.compile(
+    r"(?<!\d)(\d{1,2})[\s\-_./]*"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    r"[\s\-_./,]*(\d{4}|\d{2})(?!\d)", re.IGNORECASE)
+_DIGIT_RUN_RE = re.compile(r"\d{6,}")
+_ARABIC_MARKS_RE = re.compile(r"[ً-ْـ]")
 
 
 def _parse_version(stem):
@@ -536,144 +557,296 @@ def _parse_version(stem):
     return tuple(int(x) for x in m.group(1).split("."))
 
 
+def _mk_date(y, m, d):
+    try:
+        y, m, d = int(y), int(m), int(d)
+        if y < 100:
+            y += 2000
+        if not (_DATE_YEAR_MIN <= y <= _DATE_YEAR_MAX):
+            return None
+        return datetime(y, m, d)
+    except ValueError:
+        return None
+
+
+def _date_from_digit_run(run):
+    """ddmmyyyy / yyyymmdd / dmmyyyy / ddmyyyy / ddmmyy. A run longer than 8
+    digits is treated as a typo ('106092026') and its last 8 digits are used."""
+    n = len(run)
+    tries = []
+    if n == 8:
+        tries = [(run[4:], run[2:4], run[:2]), (run[:4], run[4:6], run[6:])]
+    elif n == 7:
+        tries = [(run[3:], run[1:3], run[:1]), (run[3:], run[2:3], run[:2])]
+    elif n == 6:
+        tries = [(run[4:], run[2:4], run[:2])]
+    elif n > 8:
+        t, h = run[-8:], run[:8]
+        tries = [(t[4:], t[2:4], t[:2]), (h[4:], h[2:4], h[:2])]
+    for y, m, d in tries:
+        dt = _mk_date(y, m, d)
+        if dt:
+            return dt
+    return None
+
+
 def _parse_name_date(stem):
-    """Last valid dd-mm-yyyy / ddmmyyyy date written in the file name, or None."""
-    found = []
-    for rx in (_DATE_SEP_RE, _DATE_COMPACT_RE):
-        for m in rx.finditer(stem):
-            try:
-                d = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-            except ValueError:
-                continue
-            found.append((m.start(), d))
+    """The date written in the file name (the right-most one), or None.
+
+    Understands 09-11-2026, 9-11-2026, 9.11.26, '- 5-8-2026', 09112026,
+    2026-11-09, 20261109, 9-Nov-2026, 9 November 2026."""
+    found = []   # (end position, date)
+    for m in _DATE_DMY_RE.finditer(stem):
+        dt = _mk_date(m.group(3), m.group(2), m.group(1))
+        if dt:
+            found.append((m.end(), dt))
+    for m in _DATE_DMY_SPACE_RE.finditer(stem):
+        dt = _mk_date(m.group(3), m.group(2), m.group(1))
+        if dt:
+            found.append((m.end(), dt))
+    for m in _DATE_YMD_RE.finditer(stem):
+        dt = _mk_date(m.group(1), m.group(2), m.group(3))
+        if dt:
+            found.append((m.end(), dt))
+    for m in _DATE_MONTHNAME_RE.finditer(stem):
+        dt = _mk_date(m.group(3), _MONTH_NUM[m.group(2).lower()], m.group(1))
+        if dt:
+            found.append((m.end(), dt))
+    for m in _DIGIT_RUN_RE.finditer(stem):
+        dt = _date_from_digit_run(m.group(0))
+        if dt:
+            found.append((m.end(), dt))
     if not found:
         return None
     found.sort(key=lambda t: t[0])
     return found[-1][1]
 
 
-def _classify_env(stem):
-    """Return 'excluded' (UAT / temp ...), 'prod' or 'unmarked' for a file stem."""
-    low = stem.lower()
+def _keyword_hit(text, kw):
+    """True when `kw` (uat / temp ...) is written in `text` as its own word.
+
+    Catches '_UAT_', 'UAT-1-10', 'uat09', '(Temp)' and also glued spellings
+    such as 'SMEUAT_', 'UATjob', 'ProdTemp', 'TempV2' - but NOT the letters
+    inside a normal word ('Evaluation', 'EVALUATION', 'attempt', 'Template')."""
+    if re.search(r"(?<![a-z])" + re.escape(kw) + r"(?![a-z])", text.lower()):
+        return True
+    upper = kw.upper()
+    for m in re.finditer(re.escape(upper), text):
+        prev = text[m.start() - 1] if m.start() > 0 else ""
+        nxt = text[m.end()] if m.end() < len(text) else ""
+        if not (prev.isupper() and nxt.isupper()):
+            return True
+    cap = kw.capitalize()
+    if cap != upper:
+        for m in re.finditer(re.escape(cap), text):
+            nxt = text[m.end()] if m.end() < len(text) else ""
+            if not nxt.islower():
+                return True
+    return False
+
+
+def _classify_env(stem, rel_folders=()):
+    """Return (env, why): env is 'excluded' (UAT / temp ...), 'prod' or
+    'unmarked'. The FILE NAME decides; only when the file name says nothing
+    are the folder names (nearest folder first) consulted."""
     for kw in EXCLUDE_KEYWORDS:
-        # Whole-word match on letters only, so 'uat' does NOT hit
-        # 'Evaluation' / 'Graduation' but does hit '_UAT_', 'UAT-1-10', 'uat09'.
-        if re.search(r"(?<![a-z])" + re.escape(kw) + r"(?![a-z])", low):
-            return "excluded", kw
+        if _keyword_hit(stem, kw):
+            return "excluded", f"file name contains '{kw}'"
     if _PROD_RE.search(stem):
         return "prod", ""
+    if CHECK_FOLDER_NAMES:
+        for folder in reversed(list(rel_folders)):
+            for kw in EXCLUDE_KEYWORDS:
+                if _keyword_hit(folder, kw):
+                    return "excluded", f"folder '{folder}' contains '{kw}'"
+            if _PROD_RE.search(folder):
+                return "prod", ""
     return "unmarked", ""
 
 
-def _matrix_base_name(stem):
-    """Name with version / environment / date / punctuation removed, so that
-    different versions of the SAME matrix compare equal. Used only when
-    matrix_selection.scope == 'name'."""
-    t = stem.lower()
+_KEY_STOPWORDS = {"pre", "security", "access", "matrix", "flexcube", "fc",
+                  "f", "c", "of", "the", "and", "v"}
+
+
+def _matrix_name_key(stem):
+    """Matrix name with version / environment / date / filler words removed,
+    so different versions of the SAME matrix get the same key:
+        'V14_Access Matrix_FC_CardCenter_Prod_ 9-11-2025'  -> 'cardcenter'
+        'V15_Access Matrix_FC_CardCenter_Prod_ 04-01-2026' -> 'cardcenter'
+        'Pre Security Access Matrix FlexCube of Credit Admin - SME Prod V7 ...'
+        'V11_Access_Matrix_FlexCube_ Credit_Admin - SME Prod 25-09-2024'
+                                                        -> 'credit admin sme'
+    Returns '' when nothing meaningful is left."""
+    t = _ARABIC_MARKS_RE.sub("", stem).lower()
+    t = _DATE_MONTHNAME_RE.sub(" ", t)      # '9-Nov-2025' leaves no 'nov'
     t = _PROD_RE.sub(" ", t)
-    t = _DATE_SEP_RE.sub(" ", t)
-    t = _DATE_COMPACT_RE.sub(" ", t)
     t = re.sub(r"(?<![a-z0-9])v\s*\d+(?:\.\d+)*(?!\d)", " ", t)
-    t = re.sub(r"\(\s*\d+\s*\)", " ", t)           # '(002)' copy markers
     t = re.sub(r"[^a-z0-9؀-ۿ]+", " ", t)
-    return " ".join(t.split())
+    words = []
+    for w in t.split():
+        if w.isdigit():
+            continue                      # dates, '(002)' copy markers
+        w = re.sub(r"(?<=[a-z])v\d+$", "", w)   # 'blockingv3' -> 'blocking'
+        if w and w not in _KEY_STOPWORDS:
+            words.append(w)
+    return " ".join(words)
 
 
-def _select_latest_prod(candidates):
-    """candidates: list of dicts with name / stem / mtime.
+def _fmt_version(v):
+    return "V" + ".".join(map(str, v)) if v != (-1,) else "no version"
 
-    Returns (winners, rejected). `rejected` is a list of (candidate, reason).
-    Tiers: explicit PROD files first; only when the folder has none, files
-    with no environment word at all are used (if include_unmarked is true).
-    UAT / temp files are never selected. Inside a tier the NEWEST DATE written
-    in the file name wins; ties are broken by the highest version number in
-    the name, then by Windows modified time. A file with no readable date in
-    its name loses against any file that has one."""
+
+def _fmt_name_date(d):
+    return d.strftime("%d-%m-%Y") if d else "no date"
+
+
+def _select_matrices(candidates):
+    """Pick the matrices to copy out of EVERY Excel file found in the tree.
+
+    candidates: dicts with name / stem / source_long / source_folder /
+                rel_folders / mtime.
+    Returns (winners, rejected) where rejected is a list of (candidate, reason).
+
+    1. Files that are UAT / temp (by file name, or by folder name when the
+       file name says nothing) are dropped.
+    2. The remaining files are grouped into matrices:
+         scope 'matrix' (default): files in the same folder belong together,
+                and files with the same matrix name belong together even
+                when they sit in different folders;
+         scope 'folder': one group per folder only;
+         scope 'name'  : one group per matrix name only (a folder may then
+                yield several different matrices).
+    3. Per group ONE file wins. Files saying 'Prod' beat files with no
+       environment word. Then the newest DATE written in the file name wins,
+       then the highest VERSION in the name, then Windows modified time."""
     rejected = []
-    prod, unmarked = [], []
+    pool = []
     for c in candidates:
-        env, kw = _classify_env(c["stem"])
+        env, why = _classify_env(c["stem"], c.get("rel_folders", ()))
         c["env"] = env
         c["version"] = _parse_version(c["stem"])
         c["name_date"] = _parse_name_date(c["stem"])
+        c["name_key"] = _matrix_name_key(c["stem"])
         if env == "excluded":
-            rejected.append((c, f"Not production (name contains '{kw}')"))
-        elif env == "prod":
-            prod.append(c)
+            rejected.append((c, f"Not production ({why})"))
         else:
-            unmarked.append(c)
+            pool.append(c)
 
-    pool = prod
-    if not prod and unmarked:
-        if INCLUDE_UNMARKED:
-            pool = unmarked
-        else:
-            for c in unmarked:
-                rejected.append((c, "No 'Prod' in the file name "
-                                    "(matrix_selection.include_unmarked is false)"))
-    elif prod and unmarked:
-        for c in unmarked:
-            rejected.append((c, "No 'Prod' in the file name while a Prod "
-                                "file exists in the same folder"))
-    if not pool:
-        return [], rejected
+    # ---- group the pool (union-find) ----
+    parent = list(range(len(pool)))
+
+    def _find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union_by(key_fn):
+        first = {}
+        for i, c in enumerate(pool):
+            k = key_fn(c)
+            if k is None:
+                continue
+            if k in first:
+                parent[_find(i)] = _find(first[k])
+            else:
+                first[k] = i
+
+    if SELECTION_SCOPE in ("matrix", "folder"):
+        _union_by(lambda c: ("folder", c["source_folder"].lower()))
+    if SELECTION_SCOPE in ("matrix", "name"):
+        _union_by(lambda c: ("name", c["name_key"]) if c["name_key"] else None)
+
+    groups = defaultdict(list)
+    for i, c in enumerate(pool):
+        groups[_find(i)].append(c)
 
     def _key(c):
-        # 1) date written in the file name  2) version in the file name
-        # 3) Windows modified time (last resort)
-        return (c["name_date"] or datetime.min,
-                c["version"],
-                c["mtime"])
-
-    if SELECTION_SCOPE == "name":
-        groups = defaultdict(list)
-        for c in pool:
-            groups[_matrix_base_name(c["stem"])].append(c)
-        group_list = list(groups.values())
-    else:
-        group_list = [pool]
+        return (c["name_date"] or datetime.min, c["version"], c["mtime"])
 
     winners = []
-    for grp in group_list:
-        grp.sort(key=_key, reverse=True)
-        winner = grp[0]
+    for grp in groups.values():
+        prod = [c for c in grp if c["env"] == "prod"]
+        unmarked = [c for c in grp if c["env"] != "prod"]
+        if prod:
+            tier = prod
+            for c in unmarked:
+                rejected.append((c, "No 'Prod' in the file name while a Prod "
+                                    "file of the same matrix exists "
+                                    f"('{prod[0]['name']}')"))
+        elif INCLUDE_UNMARKED:
+            tier = unmarked
+        else:
+            for c in unmarked:
+                rejected.append((c, "No 'Prod' in the file / folder name "
+                                    "(matrix_selection.include_unmarked is false)"))
+            continue
+
+        tier.sort(key=_key, reverse=True)
+        winner = tier[0]
         winners.append(winner)
-        for c in grp[1:]:
-            cd, wd = c["name_date"], winner["name_date"]
-            if cd != wd:
+        for c in tier[1:]:
+            where = ("" if c["source_folder"] == winner["source_folder"]
+                     else f" in folder '{winner['source_folder']}'")
+            if c["name_date"] != winner["name_date"]:
                 why = (f"Older date in file name "
-                       f"({cd.strftime('%d-%m-%Y') if cd else 'no date'} < "
-                       f"{wd.strftime('%d-%m-%Y') if wd else 'no date'} "
-                       f"in '{winner['name']}')")
+                       f"({_fmt_name_date(c['name_date'])} < "
+                       f"{_fmt_name_date(winner['name_date'])}): kept "
+                       f"'{winner['name']}'{where}")
             elif c["version"] != winner["version"]:
                 why = (f"Same date in name, lower version "
-                       f"(V{'.'.join(map(str, c['version']))} < "
-                       f"V{'.'.join(map(str, winner['version']))} "
-                       f"in '{winner['name']}')")
+                       f"({_fmt_version(c['version'])} < "
+                       f"{_fmt_version(winner['version'])}): kept "
+                       f"'{winner['name']}'{where}")
             else:
-                why = (f"Same date and version as '{winner['name']}' but "
-                       f"older Windows modified time")
+                why = (f"Same date and version, older Windows modified "
+                       f"time: kept '{winner['name']}'{where}")
             rejected.append((c, why))
+    winners.sort(key=lambda c: c["name"].lower())
     return winners, rejected
 
 
-def _latest_prod_excel_in_folder(folder_long: str):
-    """Return (winners, list_of_all_entry_names, rejected).
+def _possible_duplicates(winners):
+    """Pairs of SELECTED files whose names look like the same matrix but were
+    not merged automatically (name spelled differently AND different folder).
+    Listed in the report for a human to review - nothing is dropped."""
+    import difflib
+    out = []
+    for i in range(len(winners)):
+        a = winners[i]
+        ka = a.get("name_key") or ""
+        sa = set(ka.split())
+        if not sa:
+            continue
+        for j in range(i + 1, len(winners)):
+            b = winners[j]
+            kb = b.get("name_key") or ""
+            sb = set(kb.split())
+            if not sb:
+                continue
+            small, big = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+            if len(small) >= 2 and small <= big:
+                why = "one name contains the other"
+            elif difflib.SequenceMatcher(None, ka, kb).ratio() >= 0.88:
+                why = "names are almost identical (spelling?)"
+            else:
+                continue
+            out.append((a, b, why))
+    return out
 
-    winners  : list of dicts {name, source_long, mtime, version, name_date, env}
-               (one per folder, or one per matrix name when
-               matrix_selection.scope is 'name')
-    rejected : list of (candidate_dict, reason) for every Excel file in the
-               folder that was NOT selected (UAT / temp / older version ...)
-    """
+
+def _excel_files_in_folder(folder_long: str):
+    """Return (excel_files, list_of_all_entry_names) for one folder.
+    excel_files: dicts {name, stem, source_long, mtime} for every Excel file
+    that is not a lock file ('~$...') and not in skip_files."""
     raw_entries = []
     try:
         raw_entries = os.listdir(folder_long)
     except (PermissionError, OSError) as e:
         logging.warning(f"Cannot list folder {_from_long(folder_long)}: {e}")
-        return [], raw_entries, []
+        return [], raw_entries
 
-    candidates = []
+    files = []
     for name in raw_entries:
         item_long = os.path.join(folder_long, name)
         try:
@@ -694,15 +867,42 @@ def _latest_prod_excel_in_folder(folder_long: str):
                 logging.warning(
                     f"Cannot stat file {_from_long(item_long)}: {e}")
                 continue
-            candidates.append({"name": name, "stem": stem,
-                               "source_long": item_long, "mtime": mtime})
+            files.append({"name": name, "stem": stem,
+                          "source_long": item_long, "mtime": mtime})
         except OSError as e:
             logging.warning(
                 f"Error inspecting {name} in {_from_long(folder_long)}: {e}")
             continue
+    return files, raw_entries
 
-    winners, rejected = _select_latest_prod(candidates)
-    return winners, raw_entries, rejected
+
+def _stage1_archive_leftovers():
+    """A previous run that used the SAME run folder (same hour, or a pinned
+    run_folder_name) leaves its files behind; they would be mixed with this
+    run's selection (old UAT / temp copies, '_1' duplicates). Move them out of
+    the way - nothing is deleted - into '<run folder>/_previous_run_<time>/'."""
+    try:
+        leftovers = [n for n in os.listdir(str(FILES_FOLDER))
+                     if os.path.splitext(n)[1].lower() in EXCEL_EXTENSIONS]
+    except OSError:
+        leftovers = []
+    if not leftovers:
+        return
+    archive = RUN_FOLDER / f"_previous_run_{TIMESTAMP}"
+    logging.info(
+        f"Run folder already holds {len(leftovers)} Excel file(s) from an "
+        f"earlier run - moving the earlier outputs to: {archive}")
+    moves = [(FILES_FOLDER / n, archive / FILES_FOLDER.name / n)
+             for n in leftovers]
+    for folder in (CSV_FOLDER, COMPARISON_FOLDER):
+        if folder.exists():
+            moves.append((folder, archive / folder.name))
+    for src, dst in moves:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(_to_long(src), _to_long(dst))
+        except Exception as e:
+            logging.warning(f"  Could not move {src} : {e}")
 
 
 def _resolve_duplicates(candidates):
@@ -741,23 +941,25 @@ def _autosize(ws, widths):
 
 
 def _write_xlsx_report(copied_files, folders_without_excel, duplicates_skipped,
-                       not_selected=None):
-    """4-sheet index xlsx: Access Matrix Index / Folders Without Excel /
-    Duplicates Skipped / Not Selected (UAT, temp, older versions)."""
+                       not_selected=None, possible_dups=None):
+    """5-sheet index xlsx: Access Matrix Index / Folders Without Excel /
+    Duplicates Skipped / Not Selected (UAT, temp, older versions) /
+    Possible Duplicates (selected files that look like the same matrix)."""
     wb = Workbook()
 
     ws = wb.active
     ws.title = "Access Matrix Index"
-    ws.append(["File Name", "Source Path", "Modified Time"])
+    ws.append(["File Name", "Source Path", "Modified Time",
+               "Date In Name", "Version In Name", "Environment"])
     for cell in ws[1]:
         cell.font = Font(bold=True)
-    for name, folder, mtime_str in copied_files:
-        ws.append([name, folder, mtime_str])
-    name_w = max((len(n) for n, _, _ in copied_files), default=0)
-    path_w = max((len(p) for _, p, _ in copied_files), default=0)
+    for row in copied_files:
+        ws.append(list(row))
+    name_w = max((len(r[0]) for r in copied_files), default=0)
+    path_w = max((len(r[1]) for r in copied_files), default=0)
     _autosize(ws, [("A", max(30, name_w + 2)),
                    ("B", max(50, path_w + 2)),
-                   ("C", 22)])
+                   ("C", 22), ("D", 14), ("E", 16), ("F", 14)])
     ws.freeze_panes = "A2"
 
     ws2 = wb.create_sheet(title="Folders Without Excel")
@@ -811,12 +1013,23 @@ def _write_xlsx_report(copied_files, folders_without_excel, duplicates_skipped,
                     ("D", max(40, min(120, nr_w + 2)))])
     ws4.freeze_panes = "A2"
 
+    ws5 = wb.create_sheet(title="Possible Duplicates")
+    ws5.append(["File A", "Folder A", "File B", "Folder B", "Why listed"])
+    for cell in ws5[1]:
+        cell.font = Font(bold=True)
+    for a, b, why in (possible_dups or []):
+        ws5.append([a["name"], a["source_folder"],
+                    b["name"], b["source_folder"], why])
+    _autosize(ws5, [("A", 70), ("B", 60), ("C", 70), ("D", 60), ("E", 40)])
+    ws5.freeze_panes = "A2"
+
     wb.save(_to_long(REPORT_FILE))
 
 
 def stage1_copy():
-    """Walk ROOT_FOLDER, pick the latest PROD xlsx per folder (newest date, then
-    highest version, both read from the file name; UAT / temp ignored), copy to FILES_FOLDER.
+    """Walk ROOT_FOLDER, pick ONE file per matrix over the whole tree - the
+    latest PROD one (newest date, then highest version, both read from the
+    file name; UAT / temp ignored) - and copy the winners to FILES_FOLDER.
     Returns a dict of run statistics (used by the pipeline summary)."""
     _stage1_setup_logging()
     _banner("STAGE 1 — COPY  (network share -> Files/)")
@@ -831,7 +1044,8 @@ def stage1_copy():
     logging.info(f"Selection         : PROD only, newest date in file name "
                  f"(then highest version) wins (scope={SELECTION_SCOPE}, "
                  f"exclude={EXCLUDE_KEYWORDS}, "
-                 f"include_unmarked={INCLUDE_UNMARKED})")
+                 f"include_unmarked={INCLUDE_UNMARKED}, "
+                 f"check_folder_names={CHECK_FOLDER_NAMES})")
     logging.info(f"Log file          : {LOG_FILE}")
     logging.info(f"Report file       : {REPORT_FILE}")
     logging.info("=" * 72)
@@ -842,8 +1056,11 @@ def stage1_copy():
             f"Source folder does not exist or is unreachable: {ROOT_FOLDER}")
         return {"stage": "copy", "ok": False, "error": "source not reachable"}
 
+    _stage1_archive_leftovers()
+
     candidates = []
     not_selected = []
+    all_excel = []
     folders_without_excel = []
     folders_scanned = 0
     folders_with_excel = 0
@@ -861,28 +1078,13 @@ def stage1_copy():
         subfolders[:] = [d for d in subfolders
                          if d.lower() not in SKIP_FOLDERS_LOWER]
 
-        picked, raw_entries, rejected = _latest_prod_excel_in_folder(
-            current_long)
+        found, raw_entries = _excel_files_in_folder(current_long)
 
-        for rc, reason in rejected:
-            not_selected.append({
-                "name": rc["name"],
-                "source_folder": current_display,
-                "mtime": rc["mtime"],
-                "reason": reason,
-            })
-            logging.info(f"  Not selected: {rc['name']} — {reason}")
-
-        if not picked:
+        if not found:
             if not has_subfolders:
                 entries_str = ", ".join(raw_entries) if raw_entries else ""
                 folders_without_excel.append((current_display, entries_str))
-                if rejected:
-                    logging.info(
-                        f"Flagged 'no Excel' — no production matrix in "
-                        f"folder (all {len(rejected)} Excel file(s) were "
-                        f"UAT / temp / not selected): {current_display}")
-                elif raw_entries:
+                if raw_entries:
                     logging.info(
                         f"Flagged 'no Excel' — folder has {len(raw_entries)} "
                         f"entries but none are matching Excel files: "
@@ -903,19 +1105,45 @@ def stage1_copy():
             continue
 
         folders_with_excel += 1
-        logging.info(f"Folder: {current_display}")
-        for pk in picked:
-            ver = "V" + ".".join(map(str, pk["version"])) \
-                if pk["version"] != (-1,) else "no version"
-            candidates.append({
-                "name": pk["name"],
-                "source_long": pk["source_long"],
-                "source_folder": current_display,
-                "mtime": pk["mtime"],
-            })
-            logging.info(
-                f"  Selected: {pk['name']} ({pk['env']}, {ver}, "
-                f"modified {_fmt_mtime(pk['mtime'])})")
+        rel = os.path.relpath(current_long, walk_root)
+        rel_folders = [] if rel in (".", "") else [
+            p for p in re.split(r"[\\/]+", rel) if p]
+        for f in found:
+            f["source_folder"] = current_display
+            f["rel_folders"] = rel_folders
+            all_excel.append(f)
+
+    logging.info("=" * 72)
+    logging.info(f"Excel files found in the whole tree: {len(all_excel)}")
+    picked, rejected = _select_matrices(all_excel)
+
+    for rc, reason in sorted(
+            rejected, key=lambda t: (t[0]["source_folder"], t[0]["name"])):
+        not_selected.append({
+            "name": rc["name"],
+            "source_folder": rc["source_folder"],
+            "mtime": rc["mtime"],
+            "reason": reason,
+        })
+        logging.info(f"  Not selected: {rc['name']} "
+                     f"[{rc['source_folder']}] — {reason}")
+
+    for pk in picked:
+        candidates.append(pk)
+        logging.info(
+            f"  Selected: {pk['name']} ({pk['env']}, "
+            f"date {_fmt_name_date(pk['name_date'])}, "
+            f"{_fmt_version(pk['version'])}) [{pk['source_folder']}]")
+
+    possible_dups = _possible_duplicates(picked)
+    if possible_dups:
+        logging.info("=" * 72)
+        logging.info(
+            f"{len(possible_dups)} pair(s) of selected files look like the "
+            f"same matrix under different names - please review "
+            f"(sheet 'Possible Duplicates'):")
+        for a, b, why in possible_dups:
+            logging.info(f"  ? {a['name']}  <->  {b['name']}  ({why})")
 
     winners, losers = _resolve_duplicates(candidates)
     if losers:
@@ -950,7 +1178,10 @@ def stage1_copy():
             shutil.copy2(w["source_long"], _to_long(destination))
             mtime_str = _fmt_mtime(w["mtime"])
             copied_files.append(
-                (destination.name, w["source_folder"], mtime_str))
+                (destination.name, w["source_folder"], mtime_str,
+                 _fmt_name_date(w.get("name_date")),
+                 _fmt_version(w.get("version", (-1,))),
+                 w.get("env", "")))
             logging.info(
                 f"  Copied {w['name']} (modified {mtime_str}) "
                 f"from {w['source_folder']} -> {destination.name}")
@@ -972,7 +1203,9 @@ def stage1_copy():
     logging.info(f"  Folders scanned         : {folders_scanned}")
     logging.info(f"  Folders with Excel files: {folders_with_excel}")
     logging.info(f"  Folders without Excel   : {len(folders_without_excel)}")
-    logging.info(f"  Candidates collected    : {len(candidates)}")
+    logging.info(f"  Excel files found       : {len(all_excel)}")
+    logging.info(f"  Matrices selected       : {len(candidates)}")
+    logging.info(f"  Possible duplicates     : {len(possible_dups)} pair(s)")
     logging.info(f"  Duplicates skipped      : {len(losers)}")
     logging.info(f"  UAT/temp/older not used : {len(not_selected)}")
     logging.info(f"  Files copied            : {len(copied_files)}")
@@ -981,7 +1214,7 @@ def stage1_copy():
 
     try:
         _write_xlsx_report(copied_files, folders_without_excel, losers,
-                           not_selected)
+                           not_selected, possible_dups)
         logging.info(f"Report written: {REPORT_FILE}")
     except Exception as e:
         logging.error(f"Failed to write xlsx report: {e}")
