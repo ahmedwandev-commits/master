@@ -146,14 +146,16 @@ skip_files:
 duplicate_handling: keep_newest
 
 # Which matrix files are copied.
-#   - The whole source tree is examined at once (NOT folder by folder), so the
-#     Prod copy, the UAT copy, the temp copy and the old versions of a matrix
-#     are compared with each other even when they sit in different folders.
+#   - STEP 1 - each folder on its own: the folder gives ONE file, its latest
+#     production file. Every other file of that folder is out.
+#   - STEP 2 - across folders: only the winners of step 1 are compared. When
+#     the same matrix (same name once version / date / Prod are removed) won
+#     in more than one folder, only the newest of them is copied.
 #   - Only PRODUCTION matrices are copied. A file is ignored when its NAME
 #     contains one of `exclude_keywords` (UAT, temp ...) - also when glued,
 #     e.g. 'SMEUAT_', 'ProdTemp'. If the file name says nothing, the names of
 #     its folders are checked the same way (see check_folder_names).
-#   - Per matrix exactly ONE file wins: the NEWEST DATE written in the file
+#   - "Latest" in both steps means: the NEWEST DATE written in the file
 #     name (e.g. 'Prod_19102026' beats 'Prod_17092026'); if the dates are
 #     equal, the HIGHEST VERSION in the name (V10 beats V9). A name with no
 #     readable date loses against a name that has one. The Windows
@@ -187,13 +189,11 @@ matrix_selection:
   #   false -> copy nothing for that matrix (strict prod-only)
   include_unmarked: true
 
-  # How files are grouped into "one matrix":
-  #   matrix -> (recommended) files in the same folder are one matrix, AND
-  #             files with the same matrix name are one matrix even when they
-  #             are in different folders. One file is copied per matrix.
-  #   folder -> one file per folder only (no cross-folder comparison).
-  #   name   -> one file per matrix NAME only; a folder that holds several
-  #             different matrices yields one file for each of them.
+  #   matrix -> (recommended) step 1 + step 2 as described above.
+  #   folder -> step 1 only: one file per folder, no cross-folder comparison.
+  #   name   -> step 2 only, applied to every file: one file per matrix NAME;
+  #             a folder that holds several different matrices yields one
+  #             file for each of them.
   scope: matrix
 
 # strftime pattern used for the timestamp inserted into log/report names

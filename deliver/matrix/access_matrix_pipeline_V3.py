@@ -361,10 +361,11 @@ if DUPLICATE_HANDLING not in {"keep_newest", "keep_all"}:
 # --- Stage 1: which matrix files are copied ---------------------------------
 # Only PRODUCTION matrices are copied. A file is rejected when its name (or,
 # if the name says nothing, its folder) carries one of `exclude_keywords`
-# (UAT / temp ...). The selection is done over the WHOLE tree: for every
-# matrix exactly one file wins - the one with the newest DATE written in the
-# file name, then the highest VERSION in the name (V10, V11 ...). The Windows
-# "Date modified" is only the very last tie-break.
+# (UAT / temp ...). Step 1: each folder on its own gives ONE file, its latest
+# production one. Step 2: when the same matrix won in several folders, the
+# newest of those winners is kept. "Latest" = newest DATE written in the file
+# name, then highest VERSION in the name (V10, V11 ...). The Windows "Date
+# modified" is only the very last tie-break.
 _sel = CONFIG.get("matrix_selection") or {}
 EXCLUDE_KEYWORDS = [str(k).strip().lower()
                     for k in (_sel.get("exclude_keywords")
@@ -512,9 +513,9 @@ def _stage1_setup_logging():
 # ----------------------------------------------------------------------------
 # Matrix file selection (production only, newest DATE in the name wins)
 # ----------------------------------------------------------------------------
-# The selection is done over the WHOLE source tree, not folder by folder,
-# because the Prod copy, the UAT copy, the temp copy and the older versions
-# of one matrix often live in different folders.
+# Two steps: (1) every folder on its own gives its latest production file;
+# (2) when the same matrix won in several folders, only the newest of those
+# folder winners is kept. UAT / temp files never take part.
 #
 # Typical names:
 #   V10_Access_Matrix_FlexCube_SBO_PROD_ 09-11-2026.xlsx     -> prod, 09-11-2026
@@ -707,18 +708,20 @@ def _select_matrices(candidates):
                 rel_folders / mtime.
     Returns (winners, rejected) where rejected is a list of (candidate, reason).
 
-    1. Files that are UAT / temp (by file name, or by folder name when the
-       file name says nothing) are dropped.
-    2. The remaining files are grouped into matrices:
-         scope 'matrix' (default): files in the same folder belong together,
-                and files with the same matrix name belong together even
-                when they sit in different folders;
-         scope 'folder': one group per folder only;
-         scope 'name'  : one group per matrix name only (a folder may then
-                yield several different matrices).
-    3. Per group ONE file wins. Files saying 'Prod' beat files with no
-       environment word. Then the newest DATE written in the file name wins,
-       then the highest VERSION in the name, then Windows modified time."""
+    Step 0  Files that are UAT / temp (by file name, or by folder name when
+            the file name says nothing) are dropped.
+    Step 1  EACH FOLDER ON ITS OWN: the folder's latest production file is
+            chosen; every other file of that folder is out.
+    Step 2  ACROSS FOLDERS: only the folder winners of step 1 are compared.
+            When the same matrix (same name once version / date / Prod are
+            removed) won in more than one folder, the newest one is kept.
+
+    "Latest" in both steps: a file saying 'Prod' beats a file with no
+    environment word; then the newest DATE written in the file name; then the
+    highest VERSION in the name; then Windows modified time.
+
+    matrix_selection.scope: 'matrix' = step 1 + step 2 (default),
+    'folder' = step 1 only, 'name' = step 2 only (applied to every file)."""
     rejected = []
     pool = []
     for c in candidates:
@@ -732,76 +735,80 @@ def _select_matrices(candidates):
         else:
             pool.append(c)
 
-    # ---- group the pool (union-find) ----
-    parent = list(range(len(pool)))
-
-    def _find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def _union_by(key_fn):
-        first = {}
-        for i, c in enumerate(pool):
-            k = key_fn(c)
-            if k is None:
-                continue
-            if k in first:
-                parent[_find(i)] = _find(first[k])
-            else:
-                first[k] = i
-
-    if SELECTION_SCOPE in ("matrix", "folder"):
-        _union_by(lambda c: ("folder", c["source_folder"].lower()))
-    if SELECTION_SCOPE in ("matrix", "name"):
-        _union_by(lambda c: ("name", c["name_key"]) if c["name_key"] else None)
-
-    groups = defaultdict(list)
-    for i, c in enumerate(pool):
-        groups[_find(i)].append(c)
-
     def _key(c):
         return (c["name_date"] or datetime.min, c["version"], c["mtime"])
 
-    winners = []
-    for grp in groups.values():
-        prod = [c for c in grp if c["env"] == "prod"]
-        unmarked = [c for c in grp if c["env"] != "prod"]
+    def _pick_one(group, context):
+        """Return the winner of `group` (or None); losers go to `rejected`."""
+        prod = [c for c in group if c["env"] == "prod"]
+        unmarked = [c for c in group if c["env"] != "prod"]
         if prod:
             tier = prod
+            best = max(prod, key=_key)
             for c in unmarked:
-                rejected.append((c, "No 'Prod' in the file name while a Prod "
-                                    "file of the same matrix exists "
-                                    f"('{prod[0]['name']}')"))
+                rejected.append((c, f"{context}: no 'Prod' in its name while "
+                                    f"'{best['name']}' is marked Prod"))
         elif INCLUDE_UNMARKED:
             tier = unmarked
         else:
             for c in unmarked:
                 rejected.append((c, "No 'Prod' in the file / folder name "
                                     "(matrix_selection.include_unmarked is false)"))
-            continue
+            return None
 
-        tier.sort(key=_key, reverse=True)
+        tier = sorted(tier, key=_key, reverse=True)
         winner = tier[0]
-        winners.append(winner)
         for c in tier[1:]:
             where = ("" if c["source_folder"] == winner["source_folder"]
                      else f" in folder '{winner['source_folder']}'")
             if c["name_date"] != winner["name_date"]:
-                why = (f"Older date in file name "
+                why = (f"older date in file name "
                        f"({_fmt_name_date(c['name_date'])} < "
-                       f"{_fmt_name_date(winner['name_date'])}): kept "
-                       f"'{winner['name']}'{where}")
+                       f"{_fmt_name_date(winner['name_date'])})")
             elif c["version"] != winner["version"]:
-                why = (f"Same date in name, lower version "
+                why = (f"same date in name, lower version "
                        f"({_fmt_version(c['version'])} < "
-                       f"{_fmt_version(winner['version'])}): kept "
-                       f"'{winner['name']}'{where}")
+                       f"{_fmt_version(winner['version'])})")
             else:
-                why = (f"Same date and version, older Windows modified "
-                       f"time: kept '{winner['name']}'{where}")
-            rejected.append((c, why))
+                why = "same date and version, older Windows modified time"
+            rejected.append(
+                (c, f"{context}: {why} - kept '{winner['name']}'{where}"))
+        return winner
+
+    # ---- Step 1: each folder on its own ----
+    if SELECTION_SCOPE in ("matrix", "folder"):
+        by_folder = defaultdict(list)
+        for c in pool:
+            by_folder[c["source_folder"].lower()].append(c)
+        stage1 = []
+        for grp in by_folder.values():
+            w = _pick_one(grp, "Same folder")
+            if w is not None:
+                stage1.append(w)
+    else:
+        stage1 = pool
+
+    # ---- Step 2: same matrix that won in several folders ----
+    if SELECTION_SCOPE in ("matrix", "name"):
+        by_name = defaultdict(list)
+        winners = []
+        for c in stage1:
+            if c["name_key"]:
+                by_name[c["name_key"]].append(c)
+            elif SELECTION_SCOPE == "name" and not INCLUDE_UNMARKED \
+                    and c["env"] != "prod":
+                rejected.append((c, "No 'Prod' in the file / folder name "
+                                    "(matrix_selection.include_unmarked is false)"))
+            else:
+                winners.append(c)          # no usable name -> stands alone
+        for grp in by_name.values():
+            w = _pick_one(grp, "Same matrix in another folder"
+                          if SELECTION_SCOPE == "matrix" else "Same matrix")
+            if w is not None:
+                winners.append(w)
+    else:
+        winners = stage1
+
     winners.sort(key=lambda c: c["name"].lower())
     return winners, rejected
 
@@ -1027,9 +1034,10 @@ def _write_xlsx_report(copied_files, folders_without_excel, duplicates_skipped,
 
 
 def stage1_copy():
-    """Walk ROOT_FOLDER, pick ONE file per matrix over the whole tree - the
-    latest PROD one (newest date, then highest version, both read from the
-    file name; UAT / temp ignored) - and copy the winners to FILES_FOLDER.
+    """Walk ROOT_FOLDER; step 1: each folder gives its latest PROD file
+    (newest date, then highest version, both read from the file name; UAT /
+    temp ignored); step 2: when the same matrix won in several folders only
+    the newest is kept. The winners are copied to FILES_FOLDER.
     Returns a dict of run statistics (used by the pipeline summary)."""
     _stage1_setup_logging()
     _banner("STAGE 1 — COPY  (network share -> Files/)")
