@@ -14,8 +14,8 @@ and every stage's outputs land in a subfolder of that run folder:
 Stage 1 (copy):             walks the network share and copies the latest
                             PRODUCTION matrix of every folder into FILES_FOLDER
                             (UAT / temp files are ignored; the winner is the
-                            highest version number written in the file NAME,
-                            not the Windows modified date) and writes an index
+                            newest date written in the file NAME, then the
+                            highest version, not the Windows modified date) and writes an index
                             xlsx + log into REPORTS_FOLDER.
 Stage 2 (process):          reads each xlsx in FILES_FOLDER, picks the matrix
                             sheet by scanning the top-left 10x10 for the
@@ -360,8 +360,8 @@ if DUPLICATE_HANDLING not in {"keep_newest", "keep_all"}:
 # --- Stage 1: which matrix file wins inside a folder ------------------------
 # Only PRODUCTION matrices are copied. A file is rejected when its name
 # carries one of `exclude_keywords` (UAT / temp ...). Among the remaining
-# files the winner is chosen by the VERSION written in the file name
-# (V10, V11 ...), NOT by the Windows "Date modified".
+# files the winner is chosen by the DATE written in the file name, then by
+# the VERSION in the name (V10, V11 ...) - NOT by the Windows "Date modified".
 _sel = CONFIG.get("matrix_selection") or {}
 EXCLUDE_KEYWORDS = [str(k).strip().lower()
                     for k in (_sel.get("exclude_keywords")
@@ -585,9 +585,10 @@ def _select_latest_prod(candidates):
     Returns (winners, rejected). `rejected` is a list of (candidate, reason).
     Tiers: explicit PROD files first; only when the folder has none, files
     with no environment word at all are used (if include_unmarked is true).
-    UAT / temp files are never selected. Inside a tier the highest version in
-    the file name wins; ties are broken by the date written in the name, then
-    by Windows modified time."""
+    UAT / temp files are never selected. Inside a tier the NEWEST DATE written
+    in the file name wins; ties are broken by the highest version number in
+    the name, then by Windows modified time. A file with no readable date in
+    its name loses against any file that has one."""
     rejected = []
     prod, unmarked = [], []
     for c in candidates:
@@ -618,8 +619,10 @@ def _select_latest_prod(candidates):
         return [], rejected
 
     def _key(c):
-        return (c["version"],
-                c["name_date"] or datetime.min,
+        # 1) date written in the file name  2) version in the file name
+        # 3) Windows modified time (last resort)
+        return (c["name_date"] or datetime.min,
+                c["version"],
                 c["mtime"])
 
     if SELECTION_SCOPE == "name":
@@ -636,14 +639,20 @@ def _select_latest_prod(candidates):
         winner = grp[0]
         winners.append(winner)
         for c in grp[1:]:
-            if c["version"] != winner["version"]:
-                why = (f"Older version in file name "
+            cd, wd = c["name_date"], winner["name_date"]
+            if cd != wd:
+                why = (f"Older date in file name "
+                       f"({cd.strftime('%d-%m-%Y') if cd else 'no date'} < "
+                       f"{wd.strftime('%d-%m-%Y') if wd else 'no date'} "
+                       f"in '{winner['name']}')")
+            elif c["version"] != winner["version"]:
+                why = (f"Same date in name, lower version "
                        f"(V{'.'.join(map(str, c['version']))} < "
                        f"V{'.'.join(map(str, winner['version']))} "
                        f"in '{winner['name']}')")
             else:
-                why = (f"Same version as '{winner['name']}' but older "
-                       f"(date in name / modified time)")
+                why = (f"Same date and version as '{winner['name']}' but "
+                       f"older Windows modified time")
             rejected.append((c, why))
     return winners, rejected
 
@@ -806,8 +815,8 @@ def _write_xlsx_report(copied_files, folders_without_excel, duplicates_skipped,
 
 
 def stage1_copy():
-    """Walk ROOT_FOLDER, pick the latest PROD xlsx per folder (highest version
-    in the file name; UAT / temp files ignored), copy to FILES_FOLDER.
+    """Walk ROOT_FOLDER, pick the latest PROD xlsx per folder (newest date, then
+    highest version, both read from the file name; UAT / temp ignored), copy to FILES_FOLDER.
     Returns a dict of run statistics (used by the pipeline summary)."""
     _stage1_setup_logging()
     _banner("STAGE 1 — COPY  (network share -> Files/)")
@@ -819,8 +828,8 @@ def stage1_copy():
     logging.info(f"Skip folders      : {sorted(SKIP_FOLDERS)}")
     logging.info(f"Skip files        : {sorted(SKIP_FILES)}")
     logging.info(f"Duplicate handling: {DUPLICATE_HANDLING}")
-    logging.info(f"Selection         : PROD only, highest version in file "
-                 f"name wins (scope={SELECTION_SCOPE}, "
+    logging.info(f"Selection         : PROD only, newest date in file name "
+                 f"(then highest version) wins (scope={SELECTION_SCOPE}, "
                  f"exclude={EXCLUDE_KEYWORDS}, "
                  f"include_unmarked={INCLUDE_UNMARKED})")
     logging.info(f"Log file          : {LOG_FILE}")

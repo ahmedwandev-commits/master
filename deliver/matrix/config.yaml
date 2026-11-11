@@ -149,10 +149,13 @@ duplicate_handling: keep_newest
 # (e.g. old versions, UAT copies, temp copies of the same matrix).
 #   - Only PRODUCTION matrices are copied. Any file whose NAME contains one of
 #     `exclude_keywords` as a whole word (UAT, temp ...) is ignored.
-#   - Among the remaining files the winner is the one with the HIGHEST VERSION
-#     written in the file name (V10 beats V9, 'V2_..._Prod V1 ...' is v2 ...).
+#   - Among the remaining files the winner is the one with the NEWEST DATE
+#     written in the file name (e.g. 'Prod_19102026' beats 'Prod_17092026').
+#     If the dates are equal (or a name has no readable date), the HIGHEST
+#     VERSION in the name decides (V10 beats V9; 'V2_..._Prod V1 ...' is v2).
+#     A name with no readable date loses against a name that has one.
 #     The Windows "Date modified" is NOT used, except as the very last
-#     tie-break. Ties on version are broken by the date written in the name.
+#     tie-break.
 #   - Everything that was not copied is listed, with the reason, in the
 #     "Not Selected" sheet of 02_Reports/access_matrix_index_*.xlsx.
 matrix_selection:
