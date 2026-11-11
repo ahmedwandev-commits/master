@@ -1,0 +1,275 @@
+# ============================================================================
+# Access Matrix Pipeline — Unified Configuration
+# ============================================================================
+# Six-stage end-to-end pipeline:
+#   1. copy             — pull newest access-matrix xlsx files from the source
+#   2. process          — read each xlsx, apply red/white formatting rules, write CSV
+#   3. compare          — read each csv, compare against Oracle, write diff xlsx
+#   4. summary_all_diff — aggregate every *_comparison.xlsx in all_differences/
+#                         into a single _summary.xlsx (Overview, By Role,
+#                         By Section Detail, plus per-section drill-down sheets)
+#   5. general_sql      — validate every diff row against Oracle LOV tables and
+#                         emit remediation SQL (INSERT/UPDATE/DELETE) into
+#                         all_differences/generated_sql/
+#   6. send_report      — email the three headline output files (_summary.xlsx,
+#                         all_remediation_summary.xlsx, all_remediation.sql)
+#                         to the recipient configured below
+#
+# Every pipeline run produces a SINGLE timestamped folder under `output_parent`
+# (e.g. 'ACCESS MATRIX VS SYSTEM  RUN 25-MAY-2026 1 PM') containing every
+# output sub-folder for that run:
+#     <run_folder>\01_Files\
+#     <run_folder>\02_Reports\
+#     <run_folder>\03_CSV\
+#     <run_folder>\04_Comparison\
+#     <run_folder>\failures\
+#
+# Run the whole thing with:
+#     python combo_V3.py
+# or any subset with:
+#     python combo_V3.py copy
+#     python combo_V3.py process
+#     python combo_V3.py compare
+#     python combo_V3.py summary_all_diff
+#     python combo_V3.py general_sql
+#     python combo_V3.py send_report
+#     python combo_V3.py compare summary_all_diff general_sql send_report
+#
+# IMPORTANT — YAML syntax rules for Windows paths:
+#   - Wrap the path in SINGLE QUOTES.
+#   - Use single backslashes (\) — do NOT double them.
+#   - Do NOT mix quote styles ('…path…"). Both ends must match.
+#   - Do NOT write Path(...) or r"..." — that is Python syntax, not YAML.
+# ----------------------------------------------------------------------------
+
+paths:
+  # Folder to scan recursively for input xlsx files. UNC paths supported.
+
+  source_folder: 'D:\Felex\New folder (7)'
+  # source_folder: '\\nbe.ahly.bank\epf\ITSector\Business_Technology\Flex_Cube\SMS&IT_SOP\FlexCube V14 UAT\Business\TD - CD'
+
+  # TEST PATH
+  # source_folder: 'E:\X\ACCESS MATRIX  VS  UAT CORE V14.7\ACCESS MATRIX VS SYSTEM  RUN 03-JUN-2026 5 PM\New folder'
+
+  ##--'\\nbe.ahly.bank\epf\ITSector\Business_Technology\Flex_Cube\SMS&IT_SOP\FlexCube V14 UAT'
+  #"E:\X\ACCESS MATRIX  VS  UAT CORE V14.7\ACCESS MATRIX VS SYSTEM  RUN 03-JUN-2026 5 PM\New folder"
+
+  # Parent directory under which each pipeline run creates its OWN
+  # timestamped sub-folder (e.g. 'ACCESS MATRIX VS SYSTEM  RUN 25-MAY-2026 1 PM').
+  # All five output sub-folders (01_Files, 02_Reports, 03_CSV, 04_Comparison,
+  # failures) are created INSIDE that timestamped folder. Use a LOCAL path to
+  # avoid network-share permission issues.
+
+
+  output_parent: 'D:\Felex\V12\V12'
+  # output_parent: 'E:\X\ACCESS MATRIX  VS  UAT CORE V14.7\ACCESS MATRIX VS SYSTEM  RUN 30-JUL-2026 8 AM\New folder'
+
+#  TEST PATH
+ # output_parent: 'E:\X\ACCESS MATRIX  VS  UAT CORE V14.7\ACCESS MATRIX VS SYSTEM  RUN 03-JUN-2026 5 PM\New folder\New folder'
+
+
+  # OPTIONAL — pin the run-folder name. When set, the pipeline uses this
+  # EXACT folder name and ignores `run_folder_format` below. Useful when:
+  #   - re-running send_report against a previous run's outputs
+  #   - re-running general_sql on yesterday's comparison workbooks
+  # Comment it out (or leave blank) to auto-generate a fresh timestamped
+  # folder name on every run.
+  # run_folder_name: 'ACCESS MATRIX VS SYSTEM  RUN 25-MAY-2026 1 PM'
+
+  # Path to the Oracle Instant Client directory (must contain oci.dll on
+  # Windows). Required by stages 3 and 5.
+  oracle_client_lib_dir: 'C:\oracle\instantclient_23_9'
+
+# Template used to auto-generate the run-folder name when `paths.run_folder_name`
+# is not set. Tokens (Python str.format syntax):
+#   {day}, {day:02d}      — day of month
+#   {month}, {month:02d}  — month number
+#   {month_abbr}          — three-letter month, UPPERCASE (JAN, MAY, DEC...)
+#   {year}                — 4-digit year
+#   {hour_12}             — 12-hour clock (1..12, NO leading zero)
+#   {hour_24}             — 24-hour clock (0..23)
+#   {minute}, {minute:02d}— minute
+#   {ampm}                — 'AM' or 'PM'
+# With the default below, a run started on 25 May 2026 at 13:00 produces:
+#     'ACCESS MATRIX VS SYSTEM  RUN 25-MAY-2026 1 PM'
+# (Note the two spaces between "SYSTEM" and "RUN" — preserved on purpose.)
+run_folder_format: 'ACCESS MATRIX VS SYSTEM  RUN {day:02d}-{month_abbr}-{year} {hour_12} {ampm}'
+
+# Sub-folder names inside the run folder. Defaults shown — override only
+# if you really need to rename them.
+subfolder_names:
+  files:      '01_Files'
+  reports:    '02_Reports'
+  csv:        '03_CSV'
+  comparison: '04_Comparison'
+  failures:   'failures'
+
+# ============================================================================
+# Stage 1: copy — settings
+# ============================================================================
+
+# File extensions treated as Excel files (case-insensitive).
+excel_extensions:
+  - .xlsx
+  - .xlsm
+  - .xls
+  - .xlsb
+
+# Folder names to skip entirely (case-insensitive). os.walk will not descend
+# into these, so anything underneath them is also skipped.
+#
+# The output-subfolder names are included defensively — they're irrelevant
+# now that outputs live in a separate timestamped folder, but the entries
+# protect against accidentally scanning into a leftover output folder if
+# someone copies the script into the source tree.
+skip_folders:
+  - Service Account
+  - OBCL
+  - 01_Files
+  - 02_Reports
+  - 03_CSV
+  - 04_Comparison
+  - failures
+
+# Individual FILE names to ignore (case-insensitive). Matches on the stem
+# (extension stripped), so any of these patterns work for
+# "Products didn't fetch.xlsx":
+#     - Products didn't fetch
+#     - Products didn't fetch.xlsx
+skip_files:
+  - Products didn't fetch
+
+# How to handle the same Excel filename appearing in multiple source folders:
+#   keep_newest — copy only the newest version (older versions recorded in
+#                 the index xlsx's "Duplicates Skipped" sheet).
+#   keep_all    — copy every occurrence (renamed file_1.xlsx, file_2.xlsx, …).
+duplicate_handling: keep_newest
+
+# Which matrix file is picked when a folder holds several Excel files
+# (e.g. old versions, UAT copies, temp copies of the same matrix).
+#   - Only PRODUCTION matrices are copied. Any file whose NAME contains one of
+#     `exclude_keywords` as a whole word (UAT, temp ...) is ignored.
+#   - Among the remaining files the winner is the one with the HIGHEST VERSION
+#     written in the file name (V10 beats V9, 'V2_..._Prod V1 ...' is v2 ...).
+#     The Windows "Date modified" is NOT used, except as the very last
+#     tie-break. Ties on version are broken by the date written in the name.
+#   - Everything that was not copied is listed, with the reason, in the
+#     "Not Selected" sheet of 02_Reports/access_matrix_index_*.xlsx.
+matrix_selection:
+  # Words (case-insensitive, whole-word) that mark a file as NOT production.
+  exclude_keywords:
+    - uat
+    - temp
+    - temporary
+    - tmp
+
+  # Files with no environment word at all (neither Prod nor UAT/temp), e.g.
+  # 'V29_Access Matrix _F.xlsx'. A file that says 'Prod' always wins over
+  # them; this switch only decides what happens in a folder that has NO
+  # file saying 'Prod':
+  #   true  -> use the highest-version unmarked file
+  #   false -> copy nothing from that folder (strict prod-only)
+  include_unmarked: true
+
+  # folder -> exactly ONE matrix per folder (the latest prod one). Same as
+  #          the previous behaviour, only the choice of file changed.
+  # name   -> one matrix per distinct matrix name inside the folder (use this
+  #          if a folder legitimately holds several different matrices, e.g.
+  #          the CardCenter 'Split' files, and you want the latest of each).
+  scope: folder
+
+# strftime pattern used for the timestamp inserted into log/report names
+# inside 02_Reports/ (this is separate from the run-folder timestamp above).
+timestamp_format: "%Y%m%d_%H%M%S"
+
+# Output file-name templates for the copy stage. {timestamp} is replaced at runtime.
+log_file_template: "copy_log_{timestamp}.log"
+report_file_template: "access_matrix_index_{timestamp}.xlsx"
+
+# ============================================================================
+# Stage 3 + 5: Oracle database credentials
+# ============================================================================
+# Used for ALL database operations (exclusion list, validation lookups,
+# system-side reads, LOV fetches). Password is in plain text — treat this
+# file accordingly (lock down file permissions, exclude from version control).
+#
+# `db_link` is OPTIONAL. When set, every FCPROD.<table> reference in every
+# SQL query is automatically rewritten to FCPROD.<table>@<db_link>. This
+# lets you connect to one Oracle service and query a different one through
+# an existing database link, without touching any query in the script.
+#   With db_link='V14_UAT_RO':
+#     select * from FCPROD.SMTB_ROLE_MASTER
+#   becomes
+#     select * from FCPROD.SMTB_ROLE_MASTER@V14_UAT_RO
+# Leave db_link blank or remove the line to query the local schema directly.
+
+# UAT CORE
+database:
+  user: '<REDACTED>'
+  password: '<REDACTED>'
+  dsn: "10.180.175.128:1521/PRODBACKUP"
+  # db_link:  'V14_UAT_RO'
+
+
+# # BS CORE
+# database:
+#   user:     '<REDACTED>'
+#   password: '<REDACTED>'
+#   dsn:      'fcshr-scan:1521/OBMACOMPDB'
+#   db_link:  'UBS147_MINICORE_MOCK.NBE.AHLY.BANK'
+
+
+# # GOLD CORE
+# database:
+#   user:     '<REDACTED>'
+#   password: '<REDACTED>'
+#   dsn:      'fcgolddb-scan:1521/PRODPDB'
+  # db_link:  'UBS147_MINICORE_MOCK.NBE.AHLY.BANK'
+
+
+# ============================================================================
+# Stage 6: send_report — Outlook email at end of pipeline
+# ============================================================================
+# Sends a status email via Outlook (win32com.client) when stage 6 runs.
+# Attachment paths are RELATIVE to the run folder, so they keep working
+# automatically as the run-folder name changes each day.
+#
+# Subject template tokens:
+#   {run_folder}  — the run folder name (e.g. 'ACCESS MATRIX VS SYSTEM  RUN ...')
+#   {date}        — ISO date (YYYY-MM-DD)
+#
+# Set `enabled: false` to skip sending entirely (useful during testing).
+# When stage 6 fails to send (Outlook closed, recipient rejected, etc.) the
+# pipeline finishes normally; the failure is reported in the terminal and
+# in failures/failures_*.txt.
+email:
+  enabled: false
+  # recipient: 'Iflex.SMS.team@nbe.com.eg'
+  # recipient: 'hany.fekry@nbe.com.eg'
+
+  # Carbon-copy recipients. Can be a YAML list (preferred) or a single
+  # string. Leave the list empty (or remove it) to send with no CC.
+  cc:
+    # - 'yasser_bayomy@nbe.com.eg'
+    # - 'waleed_as@nbe.com.eg'
+
+  subject: 'Access Matrix Pipeline Report — {run_folder}'
+
+  # The headline deliverables of a pipeline run. Paths are relative to
+  # the run folder (use absolute paths if you really must point at
+  # something outside the run folder).
+  #
+  # Patterns containing '*' or '?' are expanded with glob.glob():
+  #   - matches are attached (one file per match)
+  #   - zero matches are silently skipped (e.g. failures_*.txt when
+  #     nothing failed)
+  # Literal paths that don't exist are reported in the email body's
+  # "Missing Attachments" section.
+  attachments:
+    - '04_Comparison/all_differences/_summary.xlsx'
+    - '04_Comparison/all_differences/generated_sql/all_remediation_summary.xlsx'
+    - '04_Comparison/all_differences/generated_sql/all_remediation.sql'
+    # Stage 1's per-run index workbook (filename has a timestamp).
+    - '02_Reports/access_matrix_index_*.xlsx'
+    # Per-run failures report — only present when something failed.
+    - 'failures/failures_*.txt'
