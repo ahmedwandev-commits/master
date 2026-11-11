@@ -665,6 +665,28 @@ def _classify_env(stem, rel_folders=()):
     return "unmarked", ""
 
 
+def _drop_non_prod(paths, stage, say):
+    """SAFETY NET for stages 2-5: remove every path whose FILE NAME is marked
+    UAT / temp (matrix_selection.exclude_keywords) so such a file can never
+    be converted, compared with the database, summarised or turned into SQL -
+    even if it was put into the run folder by hand or left by an old run.
+    `say` is the stage's own print / log function. Returns the kept paths."""
+    kept = []
+    for p in paths:
+        name = os.path.basename(str(p))
+        env, why = _classify_env(os.path.splitext(name)[0])
+        if env == "excluded":
+            say(f"SKIPPED - not a production matrix ({why}): {name}")
+            _record_failure(
+                stage=stage, name=name, reason_code="NotProduction",
+                detail=f"Ignored, not a production matrix ({why}). "
+                       f"It was NOT compared with the database.",
+                input_path=str(p))
+        else:
+            kept.append(p)
+    return kept
+
+
 _KEY_STOPWORDS = {"pre", "security", "access", "matrix", "flexcube", "fc",
                   "f", "c", "of", "the", "and", "v"}
 
@@ -1692,6 +1714,7 @@ def stage2_process():
         if full.is_file():
             excel_files.append(full)
     excel_files.sort()
+    excel_files = _drop_non_prod(excel_files, "process", print)
 
     if not excel_files:
         print(f"No Excel files found in: {FILES_FOLDER}")
@@ -3511,6 +3534,8 @@ def _process_directory_csv(input_dir, output_dir):
         log.error(f"Input directory not found: {input_dir}")
         return []
     csv_files = sorted(glob.glob(os.path.join(input_dir, "*.csv")))
+    # Only production matrices are ever compared with the database.
+    csv_files = _drop_non_prod(csv_files, "compare", log.warning)
     if not csv_files:
         log.warning(f"No CSV files in directory: {input_dir}")
         return []
@@ -3774,6 +3799,7 @@ def _generate_summary_workbook(differences_dir, output_path=None):
         p for p in glob.glob(os.path.join(differences_dir, "*_comparison.xlsx"))
         if not os.path.basename(p).startswith("_summary")
     )
+    xlsx_files = _drop_non_prod(xlsx_files, "summary_all_diff", log.warning)
     if not xlsx_files:
         log.warning(
             f"[SUMMARY] No *_comparison.xlsx files in {differences_dir}")
@@ -3938,6 +3964,8 @@ def stage4_summary_all_diff():
     files = sorted(
         p for p in glob.glob(os.path.join(str(diffs_dir), "*_comparison.xlsx"))
         if not os.path.basename(p).startswith("_summary")
+        and _classify_env(
+            os.path.splitext(os.path.basename(p))[0])[0] != "excluded"
     )
     log.info(f"Input folder    : {diffs_dir}")
     log.info(f"Input files     : {len(files)} comparison workbook(s)")
@@ -5577,6 +5605,7 @@ def stage5_general_sql():
         p for p in glob.glob(os.path.join(str(diffs_dir), "*_comparison.xlsx"))
         if not os.path.basename(p).startswith("~$")
     )
+    xlsx_files = _drop_non_prod(xlsx_files, "general_sql", print)
     if not xlsx_files:
         print(f"WARNING: no *_comparison.xlsx files found under {diffs_dir}")
         return {"stage": "general_sql", "ok": True, "processed": 0,
