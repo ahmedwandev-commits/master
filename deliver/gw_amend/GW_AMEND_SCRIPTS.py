@@ -4,7 +4,7 @@ GW Amend Scripts Generator  (inc1 / inc2 / inc3)
 Same idea as SA_USER.PY, but for the gateway "amend" configuration:
 reads the rows of one or more (EXT_SYSTEM, SOURCE_OPERATION) pairs from the
 SOURCE Oracle DB (UAT: fcuatdb-scan/PRODPDB) and writes the three ready-to-run
-scripts for the TARGET DB (BS: fcshr-scan/PRODPDB) in ONE run:
+scripts for the TARGET DB (BS: fcshr-scan/PRODPDB) in ONE run, all in ONE file:
 
     inc1.sql  ->  GWTM_AMEND_NODES    (one row per node)
     inc2.sql  ->  GWTM_AMEND_MASTER   (one row per ext-system / operation)
@@ -29,10 +29,9 @@ HOW TO RUN
          python GW_AMEND_SCRIPTS.py --users SUBMWFCPR --skip-existing
              -> every INSERT gets "WHERE NOT EXISTS" so the scripts can be
                 re-run on TARGET without ORA-00001 (nothing is ever deleted)
-  3. Output (next to this script, in generated_amend_sql\\):
-         inc1.sql, inc2.sql, inc3.sql   <- the three scripts
-         run_all.sql                    <- runs them in the safe order
-                                           (inc2 master -> inc1 nodes -> inc3 fields)
+  3. Output: ONE file  generated_amend_sql\\GW_AMEND_SCRIPT.sql  (or --output)
+     holding inc1 + inc2 + inc3 together, in the safe order
+     inc2 (master) -> inc1 (nodes) -> inc3 (fields), with one COMMIT at the end.
 
 Key design rules
 ----------------
@@ -109,7 +108,7 @@ EXCEL_USER_ID_COLUMN_ALIASES = [
 
 # ── Output ───────────────────────────────────────────────────────────────────
 HERE    = Path(__file__).parent
-OUT_DIR = HERE / "generated_amend_sql"
+OUT_FILE = HERE / "generated_amend_sql" / "GW_AMEND_SCRIPT.sql"   # inc1+inc2+inc3 together
 
 # ── The three scripts ────────────────────────────────────────────────────────
 # (file name, table, key columns used for ORDER BY / WHERE NOT EXISTS)
@@ -269,7 +268,7 @@ def _sort_key(row: Dict[str, Any], keys: List[str]) -> tuple:
     return tuple("" if row.get(k) is None else str(row[k]) for k in keys if k in row)
 
 
-def build_script(
+def build_section(
     file_name:     str,
     table:         str,
     key_cols:      List[str],
@@ -284,15 +283,11 @@ def build_script(
     keys     = [k for k in key_cols if k in cols] or cols
 
     out: List[str] = [
+        "",
         "-- ================================================================",
-        f"-- {file_name}  ->  {table}",
-        f"-- Generated     : {datetime.now():%Y-%m-%d %H:%M}",
-        f"-- Source DB     : {SRC_DSN}  (schema {SRC_SCHEMA})",
-        f"-- Target DB     : {TGT_DSN}  <-- run here",
-        "-- Users         : " + ", ".join(sorted({e for e, _ in pairs})),
-        f"-- Rows          : {len(rows)}",
+        f"-- {file_name.replace('.sql', '')}  ->  {table}   ({len(rows)} rows)",
         "-- ================================================================",
-        "SET DEFINE OFF;",
+        f"PROMPT {file_name.replace('.sql', '')} : {table} ({len(rows)} rows)",
         "",
     ]
 
@@ -312,22 +307,26 @@ def build_script(
         out.append("")
 
     if not rows:
-        out.append(f"-- NOTE: no rows found in SOURCE {table} for the requested pairs.")
-    out.append("commit;")
+        out.append(f"-- NOTE: no rows found in SOURCE {table} for the requested users.")
     return "\n".join(out) + "\n"
 
 
-def build_run_all(out_dir: Path) -> str:
-    lines = [
-        "-- Runs the three amend scripts on TARGET in the safe order:",
-        "--   inc2 (master) -> inc1 (nodes) -> inc3 (fields)",
+def build_combined(sections: Dict[str, str], pairs: List[Pair]) -> str:
+    """inc1 + inc2 + inc3 in ONE file, in RUN_ORDER, with a single COMMIT."""
+    head = [
+        "-- ================================================================",
+        "-- GW amend script  (inc1 + inc2 + inc3 in one file)",
+        f"-- Generated     : {datetime.now():%Y-%m-%d %H:%M}",
+        f"-- Source DB     : {SRC_DSN}  (schema {SRC_SCHEMA})",
+        f"-- Target DB     : {TGT_DSN}  <-- run here",
+        "-- Users         : " + ", ".join(sorted({e for e, _ in pairs})),
+        "-- Order         : " + " -> ".join(f.replace(".sql", "") for f in RUN_ORDER)
+        + "   (master first, then nodes, then fields)",
+        "-- ================================================================",
         "SET DEFINE OFF;",
-        f"SPOOL {out_dir.name}_run_all.log",
     ]
-    for f in RUN_ORDER:
-        lines += [f"PROMPT ===== {f} =====", f"@@{f}"]
-    lines.append("SPOOL OFF;")
-    return "\n".join(lines) + "\n"
+    body = "".join(sections[f] for f in RUN_ORDER)
+    return "\n".join(head) + "\n" + body + "\ncommit;\n"
 
 
 # =============================================================================
@@ -347,7 +346,8 @@ def main() -> int:
     p.add_argument("--sheet", default=str(EXCEL_SHEET), help="Excel sheet name or 0-based index")
     p.add_argument("--operation", metavar="OP",
                    help="Optional: only this SOURCE_OPERATION (e.g. ModifyCustomer). Default = all.")
-    p.add_argument("--output-dir", default=str(OUT_DIR), metavar="DIR")
+    p.add_argument("--output", default=str(OUT_FILE), metavar="FILE",
+                   help=f"The single output SQL file (default: {OUT_FILE})")
     p.add_argument("--skip-existing", action="store_true",
                    help="Generate INSERT ... WHERE NOT EXISTS (re-runnable on TARGET)")
     args = p.parse_args()
@@ -359,15 +359,15 @@ def main() -> int:
     op = _clean(args.operation)
     pairs: List[Pair] = [(u, op) for u in user_ids]
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = Path(args.output)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("  GW Amend Scripts Generator  (inc1 / inc2 / inc3)")
     print("=" * 60)
     print(f"  Source DB  : {SRC_DSN}  (schema {SRC_SCHEMA})")
     print(f"  Target DB  : {TGT_DSN}")
-    print(f"  Output dir : {out_dir.resolve()}")
+    print(f"  Output     : {out_file.resolve()}")
     print(f"  Mode       : {'INSERT ... WHERE NOT EXISTS' if args.skip_existing else 'plain INSERT'}")
     print(f"  Users      : {len(user_ids)}   operation: {op or '* (all)'}")
     for u in user_ids[:10]:
@@ -383,18 +383,20 @@ def main() -> int:
         raise SystemExit(f"❌  Could not connect to Oracle:\n   {exc}") from exc
     print("  ✔  Connected.\n")
 
+    sections: Dict[str, str] = {}
     try:
         for file_name, table, key_cols in SCRIPTS:
             cols, rows = fetch_rows(conn, table, pairs)
-            sql = build_script(file_name, table, key_cols, cols, rows, pairs, args.skip_existing)
-            (out_dir / file_name).write_text(sql, encoding="utf-8")
+            sections[file_name] = build_section(
+                file_name, table, key_cols, cols, rows, pairs, args.skip_existing
+            )
             flag = "" if rows else "   ⚠  no rows!"
-            print(f"  ✔  {file_name:<9} {table:<18} {len(rows):>5} row(s){flag}")
+            print(f"  ✔  {file_name[:-4]:<5} {table:<18} {len(rows):>5} row(s){flag}")
     finally:
         conn.close()
 
-    (out_dir / "run_all.sql").write_text(build_run_all(out_dir), encoding="utf-8")
-    print(f"  ✔  run_all.sql  (order: {' -> '.join(RUN_ORDER)})")
+    out_file.write_text(build_combined(sections, pairs), encoding="utf-8")
+    print(f"\n  ✔  One file written: {out_file.resolve()}")
     print("\nDone.")
     return 0
 
