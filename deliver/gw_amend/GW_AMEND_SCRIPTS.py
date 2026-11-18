@@ -19,7 +19,7 @@ HOW TO RUN
   1. Edit the configuration below if needed (or use environment variables).
   2. Give the users the same way as SA_USER.PY:
          python GW_AMEND_SCRIPTS.py
-             -> reads EXCEL_FILE (column USER_ID / EXT_SYSTEM, else column A);
+             -> reads UserGW.xlsx (EXCEL_FILE; column USER_ID / EXT_SYSTEM, else column A);
                 if that file doesn't exist it asks you to type the users
          python GW_AMEND_SCRIPTS.py --users SUBMWFCPR,SUBMWFCXX
          python GW_AMEND_SCRIPTS.py --users-file users.txt
@@ -80,9 +80,9 @@ except ImportError as exc:
 #     PREPROD : fcpreprd-scan:1521/PRODPDB
 #     BS/SHR  : fcshr-scan:1521/PRODPDB
 #     UAT     : fcuatdb-scan:1521/PRODPDB   (default below)
-# Password: set the SRC_PWD environment variable, or the script asks for it.
+# Same login as SA_USER.PY (environment variables override these defaults).
 SRC_USER   = os.environ.get("SRC_USER",   "A_231232")
-SRC_PWD    = os.environ.get("SRC_PWD",    "")
+SRC_PWD    = os.environ.get("SRC_PWD",    "")   # set SRC_PWD or you will be asked
 SRC_DSN    = os.environ.get("SRC_DSN",    "fcuatdb-scan:1521/PRODPDB")   # UAT
 SRC_SCHEMA = os.environ.get("SRC_SCHEMA", "FCPROD")
 
@@ -98,7 +98,7 @@ ORA_CLIENT_DIR = r"C:\oracle\instantclient_23_9"
 # ── USERS (= EXT_SYSTEM values) — same input style as SA_USER.PY ─────────────
 # Priority: --users  >  --users-file  >  --excel / EXCEL_FILE  >  typed at prompt
 EXCEL_FILE = Path(
-    r"D:\Felex\access matrix  vs system pipeline\BS Scripts\Scripts\GW_AMEND\Users.xlsx"
+    r"D:\Felex\access matrix  vs system pipeline\BS Scripts\Scripts\SA_USERS\UserGW.xlsx"
 )
 EXCEL_SHEET = 0
 EXCEL_USER_ID_COLUMN_ALIASES = [
@@ -108,7 +108,8 @@ EXCEL_USER_ID_COLUMN_ALIASES = [
 
 # ── Output ───────────────────────────────────────────────────────────────────
 HERE    = Path(__file__).parent
-OUT_FILE = HERE / "generated_amend_sql" / "GW_AMEND_SCRIPT.sql"   # inc1+inc2+inc3 together
+OUT_FILE   = HERE / "generated_amend_sql" / "GW_AMEND_SCRIPT.sql"   # inc1+inc2+inc3 together
+SPOOL_FILE = r"D:\GW_AMEND.TXT"                                   # log when run on TARGET
 
 # ── The three scripts ────────────────────────────────────────────────────────
 # (file name, table, key columns used for ORDER BY / WHERE NOT EXISTS)
@@ -324,9 +325,10 @@ def build_combined(sections: Dict[str, str], pairs: List[Pair]) -> str:
         + "   (master first, then nodes, then fields)",
         "-- ================================================================",
         "SET DEFINE OFF;",
+        f"SPOOL {SPOOL_FILE}",
     ]
     body = "".join(sections[f] for f in RUN_ORDER)
-    return "\n".join(head) + "\n" + body + "\ncommit;\n"
+    return "\n".join(head) + "\n" + body + "\ncommit;\nSPOOL OFF;\n"
 
 
 # =============================================================================
