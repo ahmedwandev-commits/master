@@ -12,18 +12,21 @@ scripts for the TARGET DB (BS: fcshr-scan/PRODPDB) in ONE run:
 
 HOW TO RUN
 ----------
+  "User" here = the EXT_SYSTEM value (e.g. SUBMWFCPR). For every user, all of
+  its rows in the 3 tables are taken (all SOURCE_OPERATIONs, unless
+  --operation is given).
+
   1. Edit the configuration below if needed (or use environment variables).
-  2. Run the script:
+  2. Give the users the same way as SA_USER.PY:
          python GW_AMEND_SCRIPTS.py
-             -> uses DEFAULT_PAIRS below (SUBMWFCPR / ModifyCustomer)
-         python GW_AMEND_SCRIPTS.py --ext-system SUBMWFCPR --operation ModifyCustomer
-         python GW_AMEND_SCRIPTS.py --ext-system SUBMWFCPR
-             -> every SOURCE_OPERATION of that ext system
-         python GW_AMEND_SCRIPTS.py --pairs "SUBMWFCPR:ModifyCustomer;SUBMWFCPR:CreateCustomer"
-         python GW_AMEND_SCRIPTS.py --excel "D:\\...\\Operations.xlsx"
-             -> Excel with columns EXT_SYSTEM and SOURCE_OPERATION
-                (SOURCE_OPERATION may be empty = all operations)
-         python GW_AMEND_SCRIPTS.py --skip-existing
+             -> reads EXCEL_FILE (column USER_ID / EXT_SYSTEM, else column A);
+                if that file doesn't exist it asks you to type the users
+         python GW_AMEND_SCRIPTS.py --users SUBMWFCPR,SUBMWFCXX
+         python GW_AMEND_SCRIPTS.py --users-file users.txt
+         python GW_AMEND_SCRIPTS.py --excel "D:\\...\\Users.xlsx"
+         python GW_AMEND_SCRIPTS.py --users SUBMWFCPR --operation ModifyCustomer
+             -> only that operation
+         python GW_AMEND_SCRIPTS.py --users SUBMWFCPR --skip-existing
              -> every INSERT gets "WHERE NOT EXISTS" so the scripts can be
                 re-run on TARGET without ORA-00001 (nothing is ever deleted)
   3. Output (next to this script, in generated_amend_sql\\):
@@ -93,10 +96,15 @@ TGT_SCHEMA = ""
 # ── Oracle Instant Client (thick mode; leave as-is if not needed) ────────────
 ORA_CLIENT_DIR = r"C:\oracle\instantclient_23_9"
 
-# ── Default pairs used when nothing is given on the command line ─────────────
-#    (EXT_SYSTEM, SOURCE_OPERATION)   — SOURCE_OPERATION None = all operations
-DEFAULT_PAIRS: List[Tuple[str, Optional[str]]] = [
-    ("SUBMWFCPR", "ModifyCustomer"),
+# ── USERS (= EXT_SYSTEM values) — same input style as SA_USER.PY ─────────────
+# Priority: --users  >  --users-file  >  --excel / EXCEL_FILE  >  typed at prompt
+EXCEL_FILE = Path(
+    r"D:\Felex\access matrix  vs system pipeline\BS Scripts\Scripts\GW_AMEND\Users.xlsx"
+)
+EXCEL_SHEET = 0
+EXCEL_USER_ID_COLUMN_ALIASES = [
+    "USER_ID", "USERID", "USER ID", "EXT_SYSTEM", "EXT SYSTEM",
+    "ID", "USERNAME", "USER NAME",
 ]
 
 # ── Output ───────────────────────────────────────────────────────────────────
@@ -115,33 +123,34 @@ RUN_ORDER = ["inc2.sql", "inc1.sql", "inc3.sql"]
 
 
 # =============================================================================
-# Input: which (EXT_SYSTEM, SOURCE_OPERATION) pairs
+# Input: which users (EXT_SYSTEM values)   — same rules as SA_USER.PY
 # =============================================================================
 
-Pair = Tuple[str, Optional[str]]
+Pair = Tuple[str, Optional[str]]      # (EXT_SYSTEM, SOURCE_OPERATION or None=all)
 
 
 def _clean(v: Any) -> Optional[str]:
-    if v is None:
+    if v is None or isinstance(v, (bool, date, datetime)):
         return None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
     s = str(v).strip()
     return s or None
 
 
-def parse_pairs(raw: str) -> List[Pair]:
-    """'SYS1:Op1;SYS1:Op2;SYS2' -> [(SYS1,Op1),(SYS1,Op2),(SYS2,None)]"""
-    pairs: List[Pair] = []
-    for item in re.split(r"[;,\s]+", raw.strip()):
-        if not item:
-            continue
-        ext, _, op = item.partition(":")
-        ext = _clean(ext)
-        if ext:
-            pairs.append((ext, _clean(op)))
-    return pairs
+def parse_user_ids(raw: str) -> List[str]:
+    """Users separated by comma / space / semicolon / new line."""
+    skip = {a.upper() for a in EXCEL_USER_ID_COLUMN_ALIASES}
+    seen, out = set(), []
+    for item in re.split(r"[\s,;]+", raw.strip()):
+        uid = _clean(item)
+        if uid and uid.upper() not in skip and uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
 
 
-def read_pairs_from_excel(path: Path, sheet: Any = 0) -> List[Pair]:
+def read_user_ids_from_excel(path: Path, sheet: Any = EXCEL_SHEET) -> List[str]:
     try:
         import openpyxl
     except ImportError as exc:
@@ -154,39 +163,39 @@ def read_pairs_from_excel(path: Path, sheet: Any = 0) -> List[Pair]:
     rows = [list(r) for r in ws.iter_rows(values_only=True)]
     wb.close()
 
-    ext_idx = op_idx = hdr_idx = None
+    # header row (first 10 rows) with one of the aliases, else column A
+    col, start = 0, 0
     for i, row in enumerate(rows[:10]):
-        hdr = [str(c).strip().upper().replace(" ", "_") if c is not None else "" for c in row]
-        if "EXT_SYSTEM" in hdr:
-            hdr_idx, ext_idx = i, hdr.index("EXT_SYSTEM")
-            for name in ("SOURCE_OPERATION", "OPERATION", "SOURCE_OP"):
-                if name in hdr:
-                    op_idx = hdr.index(name)
-                    break
+        hdr = [str(c).strip().upper() if c is not None else "" for c in row]
+        hit = next((hdr.index(a) for a in EXCEL_USER_ID_COLUMN_ALIASES if a in hdr), None)
+        if hit is not None:
+            col, start = hit, i + 1
+            print(f"  ✔  Excel: user column '{row[hit]}' (column {hit + 1}, header row {i + 1})")
             break
-    if hdr_idx is None:
-        raise SystemExit("❌  Excel: no 'EXT_SYSTEM' header found in the first 10 rows.")
+    else:
+        print("  ⚠  Excel: no user header found — reading column A.")
 
-    pairs: List[Pair] = []
-    for row in rows[hdr_idx + 1:]:
-        ext = _clean(row[ext_idx]) if ext_idx < len(row) else None
-        op  = _clean(row[op_idx]) if op_idx is not None and op_idx < len(row) else None
-        if ext:
-            pairs.append((ext, op))
-    return pairs
+    vals = [str(_clean(r[col])) for r in rows[start:] if col < len(r) and _clean(r[col])]
+    return parse_user_ids("\n".join(vals))
 
 
-def dedupe_pairs(pairs: List[Pair]) -> List[Pair]:
-    """Remove duplicates; (EXT, None) already covers every (EXT, op)."""
-    all_ops = {e for e, o in pairs if o is None}
-    seen, out = set(), []
-    for e, o in pairs:
-        if o is not None and e in all_ops:
-            continue
-        if (e, o) not in seen:
-            seen.add((e, o))
-            out.append((e, o))
-    return out
+def load_user_ids(args: argparse.Namespace) -> List[str]:
+    if args.users:
+        print("  ℹ  Users from: --users")
+        return parse_user_ids(args.users)
+    if args.users_file:
+        p = Path(args.users_file)
+        if not p.exists():
+            raise SystemExit(f"❌  Users file not found: {p}")
+        print(f"  ℹ  Users from: text file {p}")
+        return parse_user_ids(p.read_text(encoding="utf-8", errors="ignore"))
+    excel = Path(args.excel) if args.excel else EXCEL_FILE
+    if args.excel or excel.exists():
+        sheet: Any = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
+        print(f"  ℹ  Users from: Excel {excel}")
+        return read_user_ids_from_excel(excel, sheet)
+    print(f"  ℹ  Excel not found ({excel}).")
+    return parse_user_ids(input("  Type the user(s) (EXT_SYSTEM), comma separated: "))
 
 
 # =============================================================================
@@ -208,21 +217,24 @@ def fetch_rows(
     pairs: List[Pair],
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Return (columns in table order, rows) for every requested pair."""
-    conds, binds = [], {}
-    for i, (ext, op) in enumerate(pairs):
-        binds[f"e{i}"] = ext
-        if op is None:
-            conds.append(f"(EXT_SYSTEM = :e{i})")
-        else:
-            binds[f"o{i}"] = op
-            conds.append(f"(EXT_SYSTEM = :e{i} AND SOURCE_OPERATION = :o{i})")
-    sql = f"SELECT * FROM {SRC_SCHEMA}.{table} WHERE " + " OR ".join(conds)
-
-    with conn.cursor() as cur:
-        cur.arraysize = 2000
-        cur.execute(sql, binds)
-        cols = [d[0].upper() for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    cols: List[str] = []
+    rows: List[Dict[str, Any]] = []
+    for start in range(0, len(pairs), 500):          # bounded bind count per query
+        chunk = pairs[start:start + 500]
+        conds, binds = [], {}
+        for i, (ext, op) in enumerate(chunk):
+            binds[f"e{i}"] = ext
+            if op is None:
+                conds.append(f"(EXT_SYSTEM = :e{i})")
+            else:
+                binds[f"o{i}"] = op
+                conds.append(f"(EXT_SYSTEM = :e{i} AND SOURCE_OPERATION = :o{i})")
+        sql = f"SELECT * FROM {SRC_SCHEMA}.{table} WHERE " + " OR ".join(conds)
+        with conn.cursor() as cur:
+            cur.arraysize = 2000
+            cur.execute(sql, binds)
+            cols = [d[0].upper() for d in cur.description]
+            rows += [dict(zip(cols, r)) for r in cur.fetchall()]
     return cols, rows
 
 
@@ -277,7 +289,7 @@ def build_script(
         f"-- Generated     : {datetime.now():%Y-%m-%d %H:%M}",
         f"-- Source DB     : {SRC_DSN}  (schema {SRC_SCHEMA})",
         f"-- Target DB     : {TGT_DSN}  <-- run here",
-        "-- For           : " + ", ".join(f"{e}/{o or '*'}" for e, o in pairs),
+        "-- Users         : " + ", ".join(sorted({e for e, _ in pairs})),
         f"-- Rows          : {len(rows)}",
         "-- ================================================================",
         "SET DEFINE OFF;",
@@ -327,31 +339,25 @@ def main() -> int:
         description="Generate inc1/inc2/inc3 (GWTM_AMEND_NODES/MASTER/FIELDS) "
                     "from SOURCE (UAT) for TARGET (BS) in one run.",
     )
-    p.add_argument("--ext-system", metavar="EXT", help="EXT_SYSTEM, e.g. SUBMWFCPR")
+    p.add_argument("--users", metavar="U1,U2,...",
+                   help="Users (EXT_SYSTEM values), e.g. SUBMWFCPR,SUBMWFCXX — overrides Excel")
+    p.add_argument("--users-file", metavar="FILE",
+                   help="Text file with users (one per line or comma separated)")
+    p.add_argument("--excel", metavar="PATH", help=f"Excel with a USER_ID column (default: {EXCEL_FILE})")
+    p.add_argument("--sheet", default=str(EXCEL_SHEET), help="Excel sheet name or 0-based index")
     p.add_argument("--operation", metavar="OP",
-                   help="SOURCE_OPERATION, e.g. ModifyCustomer (omit = all operations)")
-    p.add_argument("--pairs", metavar="EXT:OP;...",
-                   help='Several pairs: "SUBMWFCPR:ModifyCustomer;SUBMWFCPR:CreateCustomer"')
-    p.add_argument("--excel", metavar="PATH",
-                   help="Excel with columns EXT_SYSTEM and SOURCE_OPERATION")
-    p.add_argument("--sheet", default="0", help="Excel sheet name or 0-based index")
+                   help="Optional: only this SOURCE_OPERATION (e.g. ModifyCustomer). Default = all.")
     p.add_argument("--output-dir", default=str(OUT_DIR), metavar="DIR")
     p.add_argument("--skip-existing", action="store_true",
                    help="Generate INSERT ... WHERE NOT EXISTS (re-runnable on TARGET)")
     args = p.parse_args()
 
-    # ── pairs ────────────────────────────────────────────────────────────────
-    pairs: List[Pair] = []
-    if args.pairs:
-        pairs += parse_pairs(args.pairs)
-    if args.ext_system:
-        pairs.append((args.ext_system.strip(), _clean(args.operation)))
-    if args.excel:
-        sheet: Any = int(args.sheet) if args.sheet.isdigit() else args.sheet
-        pairs += read_pairs_from_excel(Path(args.excel), sheet)
-    if not pairs:
-        pairs = list(DEFAULT_PAIRS)
-    pairs = dedupe_pairs(pairs)
+    # ── users ────────────────────────────────────────────────────────────────
+    user_ids = load_user_ids(args)
+    if not user_ids:
+        raise SystemExit("❌  No users given.")
+    op = _clean(args.operation)
+    pairs: List[Pair] = [(u, op) for u in user_ids]
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -363,8 +369,11 @@ def main() -> int:
     print(f"  Target DB  : {TGT_DSN}")
     print(f"  Output dir : {out_dir.resolve()}")
     print(f"  Mode       : {'INSERT ... WHERE NOT EXISTS' if args.skip_existing else 'plain INSERT'}")
-    for e, o in pairs:
-        print(f"    • {e} / {o or '* (all operations)'}")
+    print(f"  Users      : {len(user_ids)}   operation: {op or '* (all)'}")
+    for u in user_ids[:10]:
+        print(f"    • {u}")
+    if len(user_ids) > 10:
+        print(f"    … and {len(user_ids) - 10} more")
     print()
 
     print(f"Connecting to {SRC_DSN} …")
